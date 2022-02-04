@@ -13,6 +13,7 @@
 module per2axi_res_channel
 #(
    // PARAMETERS
+   parameter NB_CORES       = 4,
    parameter PER_ADDR_WIDTH = 32,
    parameter PER_ID_WIDTH   = 5,
    parameter AXI_ADDR_WIDTH = 32,
@@ -31,6 +32,11 @@ module per2axi_res_channel
    output logic                      per_slave_r_opc_o,
    output logic [PER_ID_WIDTH-1:0]   per_slave_r_id_o,
    output logic [31:0]               per_slave_r_rdata_o,
+
+   // TRYX CTRL
+   output logic [NB_CORES-1:0]       axi_xresp_decerr_o,
+   output logic [NB_CORES-1:0]       axi_xresp_slverr_o,
+   output logic [NB_CORES-1:0]       axi_xresp_valid_o,
 
    // AXI4 MASTER
    //***************************************
@@ -51,6 +57,10 @@ module per2axi_res_channel
    output logic                      axi_master_b_ready_o,
 
    // CONTROL SIGNALS
+   input logic                       atop_req_i,
+   input logic [AXI_ID_WIDTH-1:0]    atop_id_i,
+   input logic [AXI_ADDR_WIDTH-1:0]  atop_add_i,
+   
    input logic                       trans_req_i,
    input logic [AXI_ID_WIDTH-1:0]    trans_id_i,
    input logic [AXI_ADDR_WIDTH-1:0]  trans_add_i
@@ -59,31 +69,113 @@ module per2axi_res_channel
    logic [31:0]                       s_per_slave_r_data;
    logic [PER_ID_WIDTH-1:0]           s_read_add_buf;
 
-   // PERIPHERAL INTERCONNECT RESPONSE REQUEST GENERATION
-   always_comb
-   begin
-        per_slave_r_valid_o  = '0;
-        per_slave_r_opc_o    = '0;
-        per_slave_r_id_o     = '0;
-        per_slave_r_rdata_o  = '0;
-        axi_master_r_ready_o = '1;
-        axi_master_b_ready_o = '1;
-        
-        if ( axi_master_r_valid_i == 1'b1 )
-        begin
-             per_slave_r_valid_o  = 1'b1;
-             per_slave_r_id_o[axi_master_r_id_i] = 1'b1;
-             per_slave_r_rdata_o  = s_per_slave_r_data;
-             axi_master_b_ready_o = 1'b0;
-        end
-        else
-            if ( axi_master_b_valid_i == 1'b1 )
-            begin
-               per_slave_r_valid_o                 = 1'b1;
-               per_slave_r_id_o[axi_master_b_id_i] = 1'b1;
-               axi_master_r_ready_o                = 1'b0;
+   typedef enum logic [1:0] { NONE, REQUEST, WAIT_R, WAIT_B } atop_res_t;
+   atop_res_t [PER_ID_WIDTH-1:0] atop_state_d, atop_state_q;
+   
+   // Handle responses.
+   always_comb begin
+      axi_master_b_ready_o = 1'b0;
+      axi_master_r_ready_o = 1'b0;
+      axi_xresp_decerr_o   = '0;
+      axi_xresp_slverr_o   = '0;
+      axi_xresp_valid_o    = '0;
+      per_slave_r_id_o     = '0;
+      per_slave_r_opc_o    = '0;
+      per_slave_r_rdata_o  = '0;
+      per_slave_r_valid_o  = 1'b0;
+
+      if (axi_master_r_valid_i) begin
+         axi_master_r_ready_o = 1'b1;
+         per_slave_r_id_o[axi_master_r_id_i] = 1'b1;
+         per_slave_r_rdata_o = s_per_slave_r_data;
+         per_slave_r_valid_o = 1'b1;
+         if (axi_master_r_resp_i[1]) begin // error
+            axi_xresp_valid_o[axi_master_r_id_i] = 1'b1;
+            if (axi_master_r_resp_i[0]) begin // decoding error
+               axi_xresp_decerr_o[axi_master_r_id_i] = 1'b1;
+            end else begin // slave error (e.g. RAB miss)
+               axi_xresp_slverr_o[axi_master_r_id_i] = 1'b1;
             end
+         end
+      end else if (axi_master_b_valid_i) begin
+         axi_master_b_ready_o = 1'b1;
+         if (atop_state_q[axi_master_b_id_i] == NONE) begin
+            per_slave_r_valid_o = 1'b1;
+            per_slave_r_id_o[axi_master_b_id_i] = 1'b1;
+
+            // Forward response/error to core.
+            // axi_master_b_resp_i[1:0] -> per_slave_r_rdata_o[1:0]
+            // 00 -> 01, 01 -> 00, 10 -> 10, 11 -> 11
+            per_slave_r_rdata_o
+               = {30'b0, axi_master_b_resp_i[1], axi_master_b_resp_i[1] ~^ axi_master_b_resp_i[0]};
+            if (axi_master_b_resp_i[1]) begin // error
+               axi_xresp_valid_o [axi_master_b_id_i] = 1'b1;
+               if (axi_master_b_resp_i[0]) begin // decording error
+                  axi_xresp_decerr_o[axi_master_b_id_i] = 1'b1;
+               end else begin // slave error (e.g. RAB miss)
+                  axi_xresp_slverr_o[axi_master_b_id_i] = 1'b1;
+               end
+            end
+         end
+      end
    end
+
+   // Atomic memory operations
+   
+   generate
+      for (genvar i = 0; i < PER_ID_WIDTH; i++) begin
+         always_comb begin
+            atop_state_d[i] = atop_state_q[i];
+
+            unique case (atop_state_q[i])
+               NONE: begin
+                  if (atop_req_i && (atop_id_i == i)) begin
+                     atop_state_d[i] = REQUEST;
+                  end
+               end
+
+               REQUEST: begin
+                  if (axi_master_r_valid_i && axi_master_r_ready_o && (axi_master_r_id_i == i)) begin
+                     atop_state_d[i] = WAIT_B;
+                  end
+                  if (axi_master_b_valid_i && axi_master_b_ready_o && (axi_master_b_id_i == i)) begin
+                     atop_state_d[i] = WAIT_R;
+                  end
+                  if (axi_master_r_valid_i && axi_master_r_ready_o && (axi_master_r_id_i == i) &&
+                      axi_master_b_valid_i && axi_master_b_ready_o && (axi_master_b_id_i == i)) begin
+                     atop_state_d[i] = NONE;
+                  end
+               end
+
+               WAIT_R: begin
+                  if (axi_master_r_valid_i && axi_master_r_ready_o && (axi_master_r_id_i == i)) begin
+                     atop_state_d[i] = NONE;
+                  end
+               end
+
+               WAIT_B: begin
+                  if (axi_master_b_valid_i && axi_master_b_ready_o && (axi_master_b_id_i == i)) begin
+                     atop_state_d[i] = NONE;
+                  end
+               end
+            
+               default : /* default */;
+            endcase
+
+
+         end
+
+         always_ff @(posedge clk_i or negedge rst_ni) begin
+            if(~rst_ni) begin
+               atop_state_q[i] <= NONE;
+            end else begin
+               atop_state_q[i] <= atop_state_d[i];
+            end
+         end
+
+      end
+   endgenerate
+
    
    // STORES REQUEST ADDRESS BIT 2 ONLY IF A READ OPERATION OCCURS
    always_ff @ (posedge clk_i, negedge rst_ni)
@@ -97,6 +189,10 @@ module per2axi_res_channel
           if(trans_req_i == 1'b1)
           begin
              s_read_add_buf[trans_id_i] <= trans_add_i[2];
+          end
+          if(atop_req_i == 1'b1)
+          begin
+             s_read_add_buf[atop_id_i] <= atop_add_i[2];
           end
       end
    end
